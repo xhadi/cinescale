@@ -1,0 +1,8 @@
+pyspark
+psycopg2-binary
+streamlit
+pandas
+numpy
+pyarrow
+pytest
+python-dotenv
