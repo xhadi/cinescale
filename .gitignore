@@ -3,7 +3,7 @@ data/raw/
 data/processed/
 
 # Docs files
-docs/
+docs/*
 !docs/CineScale_Project_Plan.md
 
 # Python
