@@ -91,11 +91,15 @@ def test_split_data_no_overlap(sample_ratings: DataFrame) -> None:
 
 
 def test_split_data_reproducible(sample_ratings: DataFrame) -> None:
-    """Test that split_data produces the same result with the same seed."""
+    """Test that split_data produces identical results with the same seed."""
     train1, test1 = split_data(sample_ratings, seed=42)
     train2, test2 = split_data(sample_ratings, seed=42)
-    assert train1.count() == train2.count()
-    assert test1.count() == test2.count()
+    train_rows1 = set((r.userId, r.movieId) for r in train1.collect())
+    train_rows2 = set((r.userId, r.movieId) for r in train2.collect())
+    test_rows1 = set((r.userId, r.movieId) for r in test1.collect())
+    test_rows2 = set((r.userId, r.movieId) for r in test2.collect())
+    assert train_rows1 == train_rows2
+    assert test_rows1 == test_rows2
 
 
 def test_train_als_model_returns_fitted_model(sample_ratings: DataFrame) -> None:
@@ -122,7 +126,7 @@ def test_compute_precision_at_k(sample_ratings: DataFrame) -> None:
     """Test that compute_precision_at_k returns a float between 0 and 1."""
     train_df, test_df = split_data(sample_ratings)
     model = train_als_model(train_df, rank=5, max_iter=3, reg_param=0.1)
-    precision = compute_precision_at_k(model, test_df, k=3, rating_threshold=4.0)
+    precision = compute_precision_at_k(model, test_df, k=10, rating_threshold=4.0)
     assert isinstance(precision, float)
     assert 0.0 <= precision <= 1.0
 
@@ -156,6 +160,8 @@ def test_export_embeddings(tmp_path: Path) -> None:
     assert list(user_pdf.columns) == ["id", "features"]
     assert list(movie_pdf.columns) == ["id", "features"]
     assert len(user_pdf.iloc[0]["features"]) == 50
+    assert user_pdf["id"].dtype in (pd.Int32Dtype(), pd.Int64Dtype(), "int32", "int64")
+    assert movie_pdf["id"].dtype in (pd.Int32Dtype(), pd.Int64Dtype(), "int32", "int64")
 
 
 def test_model_e2e_real_data(spark: SparkSession, tmp_path: Path) -> None:

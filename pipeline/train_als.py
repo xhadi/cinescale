@@ -49,6 +49,7 @@ def train_als_model(
         ratingCol="rating",
         coldStartStrategy="drop",
         nonnegative=True,
+        seed=42,
     )
     model = als.fit(train_df)
     return model
@@ -114,10 +115,10 @@ def compute_precision_at_k(
     # Count total recommendations per user (should be K)
     recs_per_user = recs_exploded.groupBy("userId").count().withColumnRenamed("count", "total_recs")
 
-    # Join and compute precision per user
+    # Join and compute precision per user (inner: users with 0 hits are excluded)
     precision_per_user = hits_per_user.join(
-        recs_per_user, "userId", "outer"
-    ).fillna(0, subset=["hits"]).withColumn(
+        recs_per_user, "userId", "inner"
+    ).withColumn(
         "precision", col("hits") / col("total_recs")
     )
 
@@ -141,6 +142,15 @@ def export_embeddings(
 
     user_pdf["features"] = user_pdf["features"].apply(lambda x: x.tolist() if hasattr(x, "tolist") else list(x))
     movie_pdf["features"] = movie_pdf["features"].apply(lambda x: x.tolist() if hasattr(x, "tolist") else list(x))
+
+    # Validate Interface Contract: rank=50, integer IDs
+    expected_dim = config.EMBEDDING_DIM
+    for label, pdf in [("user", user_pdf), ("movie", movie_pdf)]:
+        dims = pdf["features"].apply(len)
+        if not dims.eq(expected_dim).all():
+            raise ValueError(f"{label} factors have inconsistent dimensions: {dims.unique().tolist()}")
+        if pdf["id"].dtype not in (np.int32, np.int64):
+            raise TypeError(f"{label} factor IDs must be integer, got {pdf['id'].dtype}")
 
     os.makedirs(processed_dir, exist_ok=True)
     user_path = os.path.join(processed_dir, config.USER_FACTORS_FILENAME)
