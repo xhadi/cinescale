@@ -32,6 +32,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+jdk21/
 
 # PySpark
 metastore_db/
