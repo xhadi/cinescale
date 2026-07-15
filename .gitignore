@@ -4,6 +4,7 @@ data/processed/
 
 # Docs files
 docs/*
+AGENTS.md
 !docs/CineScale_Project_Plan.md
 
 # Python
