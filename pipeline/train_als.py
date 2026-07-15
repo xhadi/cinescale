@@ -115,10 +115,10 @@ def compute_precision_at_k(
     # Count total recommendations per user (should be K)
     recs_per_user = recs_exploded.groupBy("userId").count().withColumnRenamed("count", "total_recs")
 
-    # Join and compute precision per user (inner: users with 0 hits are excluded)
+    # Join and compute precision per user (outer: users with 0 hits get precision 0)
     precision_per_user = hits_per_user.join(
-        recs_per_user, "userId", "inner"
-    ).withColumn(
+        recs_per_user, "userId", "outer"
+    ).fillna(0, subset=["hits"]).withColumn(
         "precision", col("hits") / col("total_recs")
     )
 
