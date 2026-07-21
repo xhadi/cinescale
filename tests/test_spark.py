@@ -14,14 +14,13 @@ from pipeline.spark_session import get_spark_session
 def test_spark_local_session(monkeypatch):
     """Verify that get_spark_session configures and initializes a local SparkSession."""
     monkeypatch.delenv("SPARK_MASTER", raising=False)
-        
+
     spark = get_spark_session("TestLocalSpark")
-    
+
     try:
         assert spark.conf.get("spark.master") == "local[*]"
         assert spark.conf.get("spark.app.name") == "TestLocalSpark"
-        
-        # Test basic DataFrame functionality
+
         df = spark.createDataFrame([(1, "test")], ["id", "val"])
         assert df.count() == 1
     finally:
@@ -45,3 +44,5 @@ def test_spark_config_loading(monkeypatch):
         
         mock_builder.config.assert_any_call("spark.driver.memory", config.SPARK_DRIVER_MEMORY)
         mock_builder.config.assert_any_call("spark.sql.shuffle.partitions", str(config.SPARK_SHUFFLE_PARTITIONS))
+        mock_builder.config.assert_any_call("spark.executor.memory", config.SPARK_EXECUTOR_MEMORY)
+        mock_builder.config.assert_any_call("spark.default.parallelism", str(config.SPARK_DEFAULT_PARALLELISM))
