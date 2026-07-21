@@ -11,6 +11,11 @@ from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.sql.functions import col, explode
 from pyspark.sql.types import StructType, StructField
 
+# Ensure project root is in sys.path for direct script execution
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from config.schema import config
 from pipeline.spark_session import get_spark_session
 from pipeline.etl import extract_data, transform_movies, transform_ratings
@@ -36,10 +41,10 @@ def split_data(
 def train_als_model(
     train_df: DataFrame,
     rank: int = 50,
-    max_iter: int = 10,
-    reg_param: float = 0.1,
+    max_iter: int = 25,
+    reg_param: float = 0.05,
 ) -> ALS:
-    """Train ALS model and return the fitted model."""
+    """Train ALS model with implicit preferences and return the fitted model."""
     als = ALS(
         rank=rank,
         maxIter=max_iter,
@@ -47,11 +52,17 @@ def train_als_model(
         userCol="userId",
         itemCol="movieId",
         ratingCol="rating",
+        implicitPrefs=True,
+        alpha=40,
         coldStartStrategy="drop",
-        nonnegative=True,
+        checkpointInterval=5,
         seed=42,
     )
     model = als.fit(train_df)
+    model.userFactors.cache()
+    model.itemFactors.cache()
+    model.userFactors.count()
+    model.itemFactors.count()
     return model
 
 
@@ -70,103 +81,82 @@ def compute_rmse(
 
 
 def compute_precision_at_k(
-    model: ALS, test_df: DataFrame, k: int = 10, rating_threshold: float = 4.0
+    model: ALS, train_df: DataFrame, test_df: DataFrame, k: int = 10, rating_threshold: float = 4.0
 ) -> float:
     """Compute Precision@K averaged over all users in the test set.
 
     For each user, we:
-    1. Get their top-K recommended item IDs from the model
-    2. Identify items they actually rated >= rating_threshold in the test set
-    3. Precision = |recommended ∩ relevant| / K
+    1. Get their top items from the model
+    2. Filter out items they already rated in the training set
+    3. Take the top K items
+    4. Identify items they actually rated >= rating_threshold in the test set
+    5. Precision = |recommended ∩ relevant| / K
     """
-    # Get distinct users in the test set
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import row_number
+
     test_users = test_df.select("userId").distinct()
 
-    # Generate top-K recommendations for each test user
-    user_recs = model.recommendForUserSubset(test_users, k)
+    # Request more recommendations to ensure we have K after filtering
+    user_recs = model.recommendForUserSubset(test_users, k + 500)
 
-    # Explode recommendations into (userId, recommended_movieId)
     recs_exploded = user_recs.select(
         col("userId"),
         explode(col("recommendations")).alias("rec"),
     ).select(
         col("userId"),
         col("rec.movieId").alias("recommended_movieId"),
+        col("rec.rating").alias("predicted_rating"),
     )
 
-    # Get relevant items: items each user rated >= threshold in the test set
+    # Exclude items the user has already rated in train_df
+    train_items = train_df.select(
+        col("userId"), col("movieId").alias("train_movieId")
+    )
+    
+    recs_filtered = recs_exploded.join(
+        train_items,
+        (recs_exploded.userId == train_items.userId)
+        & (recs_exploded.recommended_movieId == train_items.train_movieId),
+        "left_anti",
+    )
+
+    # Take top K for each user
+    windowSpec = Window.partitionBy("userId").orderBy(col("predicted_rating").desc())
+    top_k_recs = recs_filtered.withColumn("rank", row_number().over(windowSpec)).filter(col("rank") <= k)
+
     relevant_items = (
         test_df.filter(col("rating") >= rating_threshold)
         .select("userId", "movieId")
         .withColumnRenamed("movieId", "relevant_movieId")
     )
 
-    # Join recommended with relevant to find hits
-    hits = recs_exploded.join(
+    hits = top_k_recs.join(
         relevant_items,
-        (recs_exploded.userId == relevant_items.userId)
-        & (recs_exploded.recommended_movieId == relevant_items.relevant_movieId),
+        (top_k_recs.userId == relevant_items.userId)
+        & (top_k_recs.recommended_movieId == relevant_items.relevant_movieId),
         "inner",
-    ).select(recs_exploded.userId, recs_exploded.recommended_movieId)
+    ).select(top_k_recs.userId, top_k_recs.recommended_movieId)
 
-    # Count hits per user
     hits_per_user = hits.groupBy("userId").count().withColumnRenamed("count", "hits")
 
-    # Count total recommendations per user (should be K)
-    recs_per_user = recs_exploded.groupBy("userId").count().withColumnRenamed("count", "total_recs")
+    recs_per_user = top_k_recs.groupBy("userId").count().withColumnRenamed("count", "total_recs")
 
-    # Join and compute precision per user (outer: users with 0 hits get precision 0)
     precision_per_user = hits_per_user.join(
         recs_per_user, "userId", "outer"
     ).fillna(0, subset=["hits"]).withColumn(
         "precision", col("hits") / col("total_recs")
     )
 
-    # Average precision across all users
     avg_precision = precision_per_user.agg({"precision": "mean"}).collect()[0][0]
     return float(avg_precision) if avg_precision is not None else 0.0
 
 
-def export_embeddings(
-    model: ALS, processed_dir: str
-) -> Tuple[str, str]:
-    """Export user and movie factor matrices to Parquet via Pandas/PyArrow.
-
-    Avoids PySpark's native Parquet writer which requires winutils on Windows.
-    """
-    user_factors = model.userFactors
-    movie_factors = model.itemFactors
-
-    user_pdf = user_factors.toPandas()
-    movie_pdf = movie_factors.toPandas()
-
-    user_pdf["features"] = user_pdf["features"].apply(lambda x: x.tolist() if hasattr(x, "tolist") else list(x))
-    movie_pdf["features"] = movie_pdf["features"].apply(lambda x: x.tolist() if hasattr(x, "tolist") else list(x))
-
-    # Validate Interface Contract: rank=50, integer IDs
-    expected_dim = config.EMBEDDING_DIM
-    for label, pdf in [("user", user_pdf), ("movie", movie_pdf)]:
-        dims = pdf["features"].apply(len)
-        if not dims.eq(expected_dim).all():
-            raise ValueError(f"{label} factors have inconsistent dimensions: {dims.unique().tolist()}")
-        if pdf["id"].dtype not in (np.int32, np.int64):
-            raise TypeError(f"{label} factor IDs must be integer, got {pdf['id'].dtype}")
-
-    os.makedirs(processed_dir, exist_ok=True)
-    user_path = os.path.join(processed_dir, config.USER_FACTORS_FILENAME)
-    movie_path = os.path.join(processed_dir, config.MOVIE_FACTORS_FILENAME)
-
-    user_pdf.to_parquet(user_path, index=False)
-    movie_pdf.to_parquet(movie_path, index=False)
-
-    return user_path, movie_path
-
-
 def run_training() -> dict:
-    """Main training pipeline: load, split, train, evaluate, export.
+    """Main training pipeline: load, split, train, evaluate.
 
     Returns:
-        dict with keys: rmse, precision_at_10, user_factors_path, movie_factors_path
+        dict with keys: rmse, precision_at_10, model
     """
     spark = None
     try:
@@ -179,16 +169,18 @@ def run_training() -> dict:
 
         logger.info("Splitting data into train/test (80/20)...")
         train_df, test_df = split_data(ratings_df)
+        train_df.cache()
+        test_df.cache()
         train_count = train_df.count()
         test_count = test_df.count()
         logger.info(f"Train ratings: {train_count}, Test ratings: {test_count}")
 
-        logger.info(f"Training ALS model (rank={config.EMBEDDING_DIM}, maxIter=10, regParam=0.1)...")
+        logger.info(f"Training ALS model (rank={config.EMBEDDING_DIM}, maxIter=25, regParam=0.05, implicitPrefs=True)...")
         model = train_als_model(
             train_df,
             rank=config.EMBEDDING_DIM,
-            max_iter=10,
-            reg_param=0.1,
+            max_iter=25,
+            reg_param=0.05,
         )
 
         logger.info("Computing RMSE on test set...")
@@ -196,19 +188,13 @@ def run_training() -> dict:
         logger.info(f"RMSE: {rmse:.4f}")
 
         logger.info("Computing Precision@10 on test set...")
-        precision_at_10 = compute_precision_at_k(model, test_df, k=10, rating_threshold=4.0)
+        precision_at_10 = compute_precision_at_k(model, train_df, test_df, k=10, rating_threshold=4.0)
         logger.info(f"Precision@10: {precision_at_10:.4f}")
-
-        logger.info("Exporting embeddings to Parquet...")
-        user_path, movie_path = export_embeddings(model, config.PROCESSED_DATA_DIR)
-        logger.info(f"User factors: {user_path}")
-        logger.info(f"Movie factors: {movie_path}")
 
         return {
             "rmse": rmse,
             "precision_at_10": precision_at_10,
-            "user_factors_path": user_path,
-            "movie_factors_path": movie_path,
+            "model": model,
         }
 
     finally:
@@ -227,6 +213,4 @@ if __name__ == "__main__":
     print(f"Training Results:")
     print(f"  RMSE:          {results['rmse']:.4f}")
     print(f"  Precision@10:  {results['precision_at_10']:.4f}")
-    print(f"  User factors:  {results['user_factors_path']}")
-    print(f"  Movie factors: {results['movie_factors_path']}")
     print(f"{'='*50}")
