@@ -17,8 +17,9 @@ from pipeline.train_als import (
     train_als_model,
     compute_rmse,
     compute_precision_at_k,
-    export_embeddings,
 )
+from pipeline.export_embeddings import export_embeddings
+from pipeline.export_embeddings import export_embeddings
 
 
 @pytest.fixture(scope="module")
@@ -122,13 +123,18 @@ def test_compute_rmse_returns_positive_float(sample_ratings: DataFrame) -> None:
     assert rmse >= 0.0
 
 
-def test_compute_precision_at_k(sample_ratings: DataFrame) -> None:
-    """Test that compute_precision_at_k returns a float between 0 and 1."""
+def test_compute_precision_at_k(spark: SparkSession, sample_ratings: DataFrame) -> None:
+    """Test that compute_precision_at_k returns a dict with precision, hit_rate, recall."""
     train_df, test_df = split_data(sample_ratings)
     model = train_als_model(train_df, rank=5, max_iter=3, reg_param=0.1)
-    precision = compute_precision_at_k(model, test_df, k=10, rating_threshold=4.0)
-    assert isinstance(precision, float)
-    assert 0.0 <= precision <= 1.0
+    metrics = compute_precision_at_k(model, train_df, test_df, spark, k=10, rating_threshold=4.0)
+    assert isinstance(metrics, dict)
+    assert "precision" in metrics
+    assert "hit_rate" in metrics
+    assert "recall" in metrics
+    for key in ("precision", "hit_rate", "recall"):
+        assert isinstance(metrics[key], float)
+        assert 0.0 <= metrics[key] <= 1.0
 
 
 def test_export_embeddings(tmp_path: Path) -> None:
@@ -185,6 +191,11 @@ def test_model_e2e_real_data(spark: SparkSession, tmp_path: Path) -> None:
     assert isinstance(rmse, float)
     assert rmse >= 0.0
 
-    precision = compute_precision_at_k(model, test_df, k=10, rating_threshold=4.0)
-    assert isinstance(precision, float)
-    assert 0.0 <= precision <= 1.0
+    metrics = compute_precision_at_k(model, train_df, test_df, spark, k=10, rating_threshold=4.0)
+    assert isinstance(metrics, dict)
+    assert "precision" in metrics
+    assert "hit_rate" in metrics
+    assert "recall" in metrics
+    for key in ("precision", "hit_rate", "recall"):
+        assert isinstance(metrics[key], float)
+        assert 0.0 <= metrics[key] <= 1.0

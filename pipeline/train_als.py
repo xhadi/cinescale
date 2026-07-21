@@ -8,7 +8,7 @@ import pandas as pd
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.sql.functions import col, explode
+from pyspark.sql.functions import col
 from pyspark.sql.types import StructType, StructField
 
 # Ensure project root is in sys.path for direct script execution
@@ -81,75 +81,165 @@ def compute_rmse(
 
 
 def compute_precision_at_k(
-    model: ALS, train_df: DataFrame, test_df: DataFrame, k: int = 10, rating_threshold: float = 4.0
-) -> float:
-    """Compute Precision@K averaged over all users in the test set.
+    model: ALS,
+    train_df: DataFrame,
+    test_df: DataFrame,
+    spark: SparkSession,
+    k: int = 10,
+    rating_threshold: float = 4.0,
+    user_batch_size: int = 2000,
+    arrow_batch_size: int = 500,
+    user_col: str = "userId",
+    item_col: str = "movieId",
+    rating_col: str = "rating",
+) -> dict:
+    """Compute Precision@K, Hit Rate, and Recall using batch-based approach.
 
-    For each user, we:
-    1. Get their top items from the model
-    2. Filter out items they already rated in the training set
-    3. Take the top K items
-    4. Identify items they actually rated >= rating_threshold in the test set
-    5. Precision = |recommended ∩ relevant| / K
+    Memory-efficient for large datasets by processing users in batches
+    with pandas_udf and broadcast variables.
+
+    Returns:
+        dict with keys: precision, hit_rate, recall
     """
-    from pyspark.sql.window import Window
-    from pyspark.sql.functions import row_number
+    import gc
+    from pyspark.sql import functions as F
+    from pyspark.sql.functions import pandas_udf, col
+    from pyspark.sql.types import ArrayType, IntegerType
 
-    test_users = test_df.select("userId").distinct()
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", str(arrow_batch_size))
 
-    # Request more recommendations to ensure we have K after filtering
-    user_recs = model.recommendForUserSubset(test_users, k + 500)
+    print("1. Collecting Item Factors to driver...")
+    item_factors_pdf = model.itemFactors.toPandas()
+    item_ids = item_factors_pdf["id"].values.astype(np.int32)
+    item_matrix = np.vstack(item_factors_pdf["features"].values).astype(np.float32)
+    print(f"   Items: {len(item_ids)}, item_matrix memory: {item_matrix.nbytes / (1024**2):.2f} MB")
+    del item_factors_pdf
+    gc.collect()
 
-    recs_exploded = user_recs.select(
-        col("userId"),
-        explode(col("recommendations")).alias("rec"),
-    ).select(
-        col("userId"),
-        col("rec.movieId").alias("recommended_movieId"),
-        col("rec.rating").alias("predicted_rating"),
+    print("2. Broadcasting item data...")
+    item_ids_bc = spark.sparkContext.broadcast(item_ids)
+    item_matrix_bc = spark.sparkContext.broadcast(item_matrix)
+
+    K_FETCH_BUFFER = 5000
+
+    @pandas_udf(ArrayType(IntegerType()))
+    def get_top_k_recs(user_features_series: pd.Series) -> pd.Series:
+        items = item_ids_bc.value
+        i_matrix = item_matrix_bc.value
+        user_matrix = np.vstack(user_features_series.values).astype(i_matrix.dtype)
+        all_scores = user_matrix @ i_matrix.T
+
+        K_fetch = min(k + K_FETCH_BUFFER, len(items))
+        result = []
+        for scores in all_scores:
+            top_idx = np.argpartition(scores, -K_fetch)[-K_fetch:]
+            top_idx = top_idx[np.argsort(-scores[top_idx])]
+            result.append(items[top_idx].tolist())
+
+        del all_scores, user_matrix
+        return pd.Series(result)
+
+    print("3. Collecting distinct test users...")
+    test_users = [r[user_col] for r in test_df.select(user_col).distinct().collect()]
+    print(f"   {len(test_users)} distinct test users -> batching by {user_batch_size}")
+
+    print("3a. Preparing relevant items per user (test set, rating >= threshold)...")
+    model_item_ids_df = model.itemFactors.select(col("id").alias(item_col)).distinct()
+
+    relevant_items_df = (
+        test_df.filter(col(rating_col) >= rating_threshold)
+        .join(model_item_ids_df, on=item_col, how="inner")
+        .groupBy(user_col)
+        .agg(F.collect_set(item_col).alias("relevant_items"))
+        .filter(F.size("relevant_items") > 0)
     )
+    relevant_items_df.cache()
+    n_relevant_users = relevant_items_df.count()
+    print(f"   Number of users with model-known relevant items: {n_relevant_users}")
 
-    # Exclude items the user has already rated in train_df
-    train_items = train_df.select(
-        col("userId"), col("movieId").alias("train_movieId")
+    print("3b. Preparing each user's training-set items for exclusion...")
+    train_items_df = (
+        train_df.groupBy(user_col)
+        .agg(F.collect_set(item_col).alias("train_items"))
     )
-    
-    recs_filtered = recs_exploded.join(
-        train_items,
-        (recs_exploded.userId == train_items.userId)
-        & (recs_exploded.recommended_movieId == train_items.train_movieId),
-        "left_anti",
-    )
+    train_items_df.cache()
+    train_items_df.count()
 
-    # Take top K for each user
-    windowSpec = Window.partitionBy("userId").orderBy(col("predicted_rating").desc())
-    top_k_recs = recs_filtered.withColumn("rank", row_number().over(windowSpec)).filter(col("rank") <= k)
+    total_precision_sum = 0.0
+    total_hits_sum = 0.0
+    total_recall_sum = 0.0
+    total_users_counted = 0
+    n_batches = (len(test_users) + user_batch_size - 1) // user_batch_size
 
-    relevant_items = (
-        test_df.filter(col("rating") >= rating_threshold)
-        .select("userId", "movieId")
-        .withColumnRenamed("movieId", "relevant_movieId")
-    )
+    for b in range(n_batches):
+        batch_users = test_users[b * user_batch_size : (b + 1) * user_batch_size]
+        print(f"   Batch {b + 1}/{n_batches} - {len(batch_users)} users")
 
-    hits = top_k_recs.join(
-        relevant_items,
-        (top_k_recs.userId == relevant_items.userId)
-        & (top_k_recs.recommended_movieId == relevant_items.relevant_movieId),
-        "inner",
-    ).select(top_k_recs.userId, top_k_recs.recommended_movieId)
+        user_batch_df = (
+            model.userFactors.filter(col("id").isin(batch_users))
+            .withColumnRenamed("id", user_col)
+        )
 
-    hits_per_user = hits.groupBy("userId").count().withColumnRenamed("count", "hits")
+        recs_df = user_batch_df.withColumn(
+            "recommendations", get_top_k_recs(col("features"))
+        ).select(user_col, "recommendations")
 
-    recs_per_user = top_k_recs.groupBy("userId").count().withColumnRenamed("count", "total_recs")
+        joined = (
+            recs_df.join(relevant_items_df, on=user_col, how="inner")
+            .join(train_items_df, on=user_col, how="left")
+        )
 
-    precision_per_user = hits_per_user.join(
-        recs_per_user, "userId", "outer"
-    ).fillna(0, subset=["hits"]).withColumn(
-        "precision", col("hits") / col("total_recs")
-    )
+        metrics_row = joined.select(
+            F.expr(
+                f"size(array_intersect("
+                f"slice(array_except(recommendations, coalesce(train_items, array())), 1, {k}), "
+                f"relevant_items)) / {k}"
+            ).alias("precision"),
+            F.expr(
+                f"IF(size(array_intersect("
+                f"slice(array_except(recommendations, coalesce(train_items, array())), 1, {k}), "
+                f"relevant_items)) > 0, 1.0, 0.0)"
+            ).alias("hit"),
+            F.expr(
+                f"size(array_intersect("
+                f"slice(array_except(recommendations, coalesce(train_items, array())), 1, {k}), "
+                f"relevant_items)) / size(relevant_items)"
+            ).alias("recall"),
+        )
 
-    avg_precision = precision_per_user.agg({"precision": "mean"}).collect()[0][0]
-    return float(avg_precision) if avg_precision is not None else 0.0
+        agg = metrics_row.agg(
+            F.sum("precision").alias("sum_p"),
+            F.sum("hit").alias("sum_hit"),
+            F.sum("recall").alias("sum_r"),
+            F.count("*").alias("cnt"),
+        ).collect()[0]
+
+        if agg["cnt"]:
+            total_precision_sum += float(agg["sum_p"])
+            total_hits_sum += float(agg["sum_hit"])
+            total_recall_sum += float(agg["sum_r"])
+            total_users_counted += agg["cnt"]
+
+        user_batch_df.unpersist()
+        recs_df.unpersist()
+        del user_batch_df, recs_df, joined, metrics_row
+        gc.collect()
+
+    item_ids_bc.unpersist()
+    item_matrix_bc.unpersist()
+    relevant_items_df.unpersist()
+    train_items_df.unpersist()
+
+    avg_precision = total_precision_sum / total_users_counted if total_users_counted else 0.0
+    avg_hit_rate = total_hits_sum / total_users_counted if total_users_counted else 0.0
+    avg_recall = total_recall_sum / total_users_counted if total_users_counted else 0.0
+
+    print(f"Precision@{k}: {avg_precision:.4f}")
+    print(f"Hit Rate@{k}: {avg_hit_rate:.4f}")
+    print(f"Recall@{k}: {avg_recall:.4f}")
+    print(f"(over {total_users_counted} users)")
+
+    return {"precision": avg_precision, "hit_rate": avg_hit_rate, "recall": avg_recall}
 
 
 def run_training() -> dict:
@@ -188,12 +278,21 @@ def run_training() -> dict:
         logger.info(f"RMSE: {rmse:.4f}")
 
         logger.info("Computing Precision@10 on test set...")
-        precision_at_10 = compute_precision_at_k(model, train_df, test_df, k=10, rating_threshold=4.0)
+        metrics = compute_precision_at_k(
+            model, train_df, test_df, spark, k=10, rating_threshold=4.0
+        )
+        precision_at_10 = metrics["precision"]
+        hit_rate_at_10 = metrics["hit_rate"]
+        recall_at_10 = metrics["recall"]
         logger.info(f"Precision@10: {precision_at_10:.4f}")
+        logger.info(f"Hit Rate@10: {hit_rate_at_10:.4f}")
+        logger.info(f"Recall@10: {recall_at_10:.4f}")
 
         return {
             "rmse": rmse,
             "precision_at_10": precision_at_10,
+            "hit_rate_at_10": hit_rate_at_10,
+            "recall_at_10": recall_at_10,
             "model": model,
         }
 
@@ -213,4 +312,6 @@ if __name__ == "__main__":
     print(f"Training Results:")
     print(f"  RMSE:          {results['rmse']:.4f}")
     print(f"  Precision@10:  {results['precision_at_10']:.4f}")
+    print(f"  Hit Rate@10:   {results['hit_rate_at_10']:.4f}")
+    print(f"  Recall@10:     {results['recall_at_10']:.4f}")
     print(f"{'='*50}")
