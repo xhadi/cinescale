@@ -3,6 +3,12 @@ import sys
 import zipfile
 import logging
 from typing import Tuple
+
+# Ensure project root is in sys.path for direct script execution
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, trim
 from pyspark.sql.types import IntegerType, StringType, FloatType, LongType
@@ -134,9 +140,33 @@ def transform_ratings(ratings_df: DataFrame) -> DataFrame:
     return transformed_df
 
 
+def filter_low_support_items(ratings_df: DataFrame, min_ratings: int = 10) -> DataFrame:
+    """Filter out movies with fewer than min_ratings ratings.
+
+    Args:
+        ratings_df: The ratings DataFrame.
+        min_ratings: Minimum number of ratings required per movie.
+
+    Returns:
+        Filtered ratings DataFrame.
+    """
+    from pyspark.sql.functions import count as spark_count
+
+    item_counts = ratings_df.groupBy("movieId").agg(spark_count("*").alias("count"))
+    valid_items = item_counts.filter(col("count") >= min_ratings).select("movieId")
+    filtered_df = ratings_df.join(valid_items, on="movieId", how="inner")
+
+    original_count = ratings_df.count()
+    filtered_count = filtered_df.count()
+    logger.info(f"Ratings before: {original_count}, after min_ratings={min_ratings} filter: {filtered_count}")
+
+    return filtered_df
+
+
 def load_data(movies_df: DataFrame, ratings_df: DataFrame, processed_dir: str) -> Tuple[str, str]:
     """
     Writes the cleaned movies and ratings DataFrames to processed_dir in Parquet format.
+    Uses Pandas/PyArrow to avoid Hadoop winutils dependency on Windows.
 
     Args:
         movies_df (DataFrame): The cleaned movies DataFrame.
@@ -146,12 +176,16 @@ def load_data(movies_df: DataFrame, ratings_df: DataFrame, processed_dir: str) -
     Returns:
         Tuple[str, str]: A tuple containing the resolved movies output path and ratings output path.
     """
+    import pandas as pd
+
     movies_path = os.path.join(processed_dir, "movies_clean.parquet")
     ratings_path = os.path.join(processed_dir, "ratings_clean.parquet")
-    
-    movies_df.write.mode("overwrite").parquet(movies_path)
-    ratings_df.write.mode("overwrite").parquet(ratings_path)
-    
+
+    os.makedirs(processed_dir, exist_ok=True)
+
+    movies_df.toPandas().to_parquet(movies_path, index=False)
+    ratings_df.toPandas().to_parquet(ratings_path, index=False)
+
     return movies_path, ratings_path
 
 
@@ -182,6 +216,12 @@ def run_etl() -> None:
         clean_movies_df = transform_movies(raw_movies_df)
         clean_ratings_df = transform_ratings(raw_ratings_df)
         
+        # Filter low-support items
+        clean_ratings_df = filter_low_support_items(clean_ratings_df, min_ratings=10)
+        
+        # Cache for downstream use
+        clean_ratings_df.cache()
+        
         clean_movies_count = clean_movies_df.count()
         clean_ratings_count = clean_ratings_df.count()
         logger.info(f"Clean movies row count: {clean_movies_count}")
@@ -205,11 +245,6 @@ def run_etl() -> None:
 
 
 if __name__ == "__main__":
-    # Ensure project root is in sys.path for direct script execution
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    
     logging.basicConfig(level=logging.INFO)
     run_etl()
 

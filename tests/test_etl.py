@@ -9,7 +9,7 @@ from pyspark.sql.types import IntegerType, StringType, FloatType, LongType
 
 from config.schema import config
 from pipeline.spark_session import get_spark_session
-from pipeline.etl import extract_data, transform_movies, transform_ratings, load_data, run_etl
+from pipeline.etl import extract_data, transform_movies, transform_ratings, filter_low_support_items, load_data, run_etl
 
 
 
@@ -369,6 +369,7 @@ def test_run_etl() -> None:
          patch("pipeline.etl.extract_data", return_value=(mock_movies_df, mock_ratings_df)) as mock_extract, \
          patch("pipeline.etl.transform_movies", return_value=mock_clean_movies_df) as mock_trans_movies, \
          patch("pipeline.etl.transform_ratings", return_value=mock_clean_ratings_df) as mock_trans_ratings, \
+         patch("pipeline.etl.filter_low_support_items", return_value=mock_clean_ratings_df) as mock_filter, \
          patch("pipeline.etl.load_data", return_value=("movies_path", "ratings_path")) as mock_load:
          
         run_etl()
@@ -378,6 +379,7 @@ def test_run_etl() -> None:
         mock_extract.assert_called_once_with(mock_spark, config.RAW_DATA_DIR)
         mock_trans_movies.assert_called_once_with(mock_movies_df)
         mock_trans_ratings.assert_called_once_with(mock_ratings_df)
+        mock_filter.assert_called_once_with(mock_clean_ratings_df, min_ratings=10)
         mock_load.assert_called_once_with(mock_clean_movies_df, mock_clean_ratings_df, config.PROCESSED_DATA_DIR)
         mock_spark.stop.assert_called_once()
 
