@@ -58,5 +58,13 @@ class AppConfig:
     def SPARK_SHUFFLE_PARTITIONS(self) -> int:
         return 200 if self.DATASET_SIZE == "32m" else 8
 
+    @property
+    def SPARK_EXECUTOR_MEMORY(self) -> str:
+        return "6g" if self.DATASET_SIZE == "32m" else "4g"
+
+    @property
+    def SPARK_DEFAULT_PARALLELISM(self) -> int:
+        return 200 if self.DATASET_SIZE == "32m" else 8
+
 # Instantiate a single configuration instance
 config = AppConfig()
