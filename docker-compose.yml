@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: cinescale_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: cinescale
+      POSTGRES_USER: cinescale_admin
+      POSTGRES_PASSWORD: cinescale_password
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - cinescale_postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U cinescale_admin -d cinescale
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  cinescale_postgres_data:
