@@ -18,15 +18,16 @@ if project_root not in sys.path:
 
 from config.schema import config
 from pipeline.spark_session import get_spark_session
-from pipeline.etl import extract_data, transform_ratings
+from pipeline.etl import extract_data, transform_ratings, filter_low_support_items
 
 logger = logging.getLogger(__name__)
 
 
 def load_and_prepare_ratings(spark: SparkSession, raw_dir: str) -> DataFrame:
-    """Extract, transform, and return clean ratings DataFrame."""
+    """Extract, transform, filter low-support items, and return clean ratings DataFrame."""
     _, raw_ratings_df = extract_data(spark, raw_dir)
     clean_ratings = transform_ratings(raw_ratings_df)
+    clean_ratings = filter_low_support_items(clean_ratings, min_ratings=10)
     return clean_ratings
 
 
