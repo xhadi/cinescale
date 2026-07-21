@@ -18,7 +18,7 @@ if project_root not in sys.path:
 
 from config.schema import config
 from pipeline.spark_session import get_spark_session
-from pipeline.etl import extract_data, transform_movies, transform_ratings
+from pipeline.etl import extract_data, transform_ratings
 
 logger = logging.getLogger(__name__)
 
