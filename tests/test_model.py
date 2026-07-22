@@ -19,7 +19,6 @@ from pipeline.train_als import (
     compute_precision_at_k,
 )
 from pipeline.export_embeddings import export_embeddings
-from pipeline.export_embeddings import export_embeddings
 
 
 @pytest.fixture(scope="module")
@@ -163,11 +162,11 @@ def test_export_embeddings(tmp_path: Path) -> None:
 
     assert len(user_pdf) == 2
     assert len(movie_pdf) == 3
-    assert list(user_pdf.columns) == ["id", "features"]
-    assert list(movie_pdf.columns) == ["id", "features"]
+    assert list(user_pdf.columns) == ["userId", "features"]
+    assert list(movie_pdf.columns) == ["movieId", "features"]
     assert len(user_pdf.iloc[0]["features"]) == 50
-    assert user_pdf["id"].dtype in (pd.Int32Dtype(), pd.Int64Dtype(), "int32", "int64")
-    assert movie_pdf["id"].dtype in (pd.Int32Dtype(), pd.Int64Dtype(), "int32", "int64")
+    assert user_pdf["userId"].dtype in (pd.Int32Dtype(), pd.Int64Dtype(), "int32", "int64")
+    assert movie_pdf["movieId"].dtype in (pd.Int32Dtype(), pd.Int64Dtype(), "int32", "int64")
 
 
 def test_model_e2e_real_data(spark: SparkSession, tmp_path: Path) -> None:
