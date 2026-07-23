@@ -1,76 +1,193 @@
 import os
 import sys
+
 import numpy as np
 import pandas as pd
 
-# Ensure project root is in sys.path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+
+# File location:
+# cinescale/data/synthetic/generate_synthetic.py
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from config.schema import config
 
-def generate_factors(num_records: int, dim: int, seed: int = 42) -> pd.DataFrame:
-    """Generate synthetic factor embeddings."""
-    np.random.seed(seed)
-    
-    # Generate unique integer IDs starting from 1
-    ids = np.arange(1, num_records + 1, dtype=np.int32)
-    
-    # Generate random floats in [-1.0, 1.0] for the embeddings
-    embeddings = np.random.uniform(-1.0, 1.0, size=(num_records, dim)).astype(np.float32)
-    
-    # Convert numpy array to list of floats for each row
-    features_list = [emb.tolist() for emb in embeddings]
-    
-    # Construct DataFrame
-    df = pd.DataFrame({
-        "id": ids,
-        "features": features_list
-    })
-    
-    return df
 
-def main():
+def generate_factors(
+    num_records: int,
+    dim: int,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Generate reproducible synthetic factor embeddings."""
+
+    if num_records <= 0:
+        raise ValueError("num_records must be greater than zero")
+
+    if dim <= 0:
+        raise ValueError("dim must be greater than zero")
+
+    rng = np.random.default_rng(seed)
+
+    ids = np.arange(
+        1,
+        num_records + 1,
+        dtype=np.int32,
+    )
+
+    embeddings = rng.uniform(
+        low=-1.0,
+        high=1.0,
+        size=(num_records, dim),
+    ).astype(np.float32)
+
+    return pd.DataFrame(
+        {
+            "id": ids,
+            "features": embeddings.tolist(),
+        }
+    )
+
+
+def validate_factors(
+    dataframe: pd.DataFrame,
+    expected_records: int,
+    expected_dim: int,
+    dataset_name: str,
+) -> None:
+    """Validate the generated factors DataFrame."""
+
+    expected_columns = ["id", "features"]
+
+    assert len(dataframe) == expected_records, (
+        f"{dataset_name}: expected {expected_records} records, "
+        f"but found {len(dataframe)}"
+    )
+
+    assert list(dataframe.columns) == expected_columns, (
+        f"{dataset_name}: expected columns {expected_columns}, "
+        f"but found {list(dataframe.columns)}"
+    )
+
+    assert dataframe["id"].is_unique, (
+        f"{dataset_name}: IDs must be unique"
+    )
+
+    assert dataframe["id"].tolist() == list(
+        range(1, expected_records + 1)
+    ), (
+        f"{dataset_name}: IDs must start from 1 and be sequential"
+    )
+
+    for row_number, features in enumerate(
+        dataframe["features"],
+        start=1,
+    ):
+        assert features is not None, (
+            f"{dataset_name}: features are missing at row {row_number}"
+        )
+
+        assert len(features) == expected_dim, (
+            f"{dataset_name}: expected embedding dimension "
+            f"{expected_dim} at row {row_number}, "
+            f"but found {len(features)}"
+        )
+
+        assert all(
+            isinstance(value, (float, np.floating))
+            for value in features
+        ), (
+            f"{dataset_name}: embedding at row {row_number} "
+            "contains non-floating-point values"
+        )
+
+        assert all(
+            -1.0 <= float(value) <= 1.0
+            for value in features
+        ), (
+            f"{dataset_name}: embedding at row {row_number} "
+            "contains values outside the range [-1.0, 1.0]"
+        )
+
+
+def main() -> None:
+    """Generate, save, reload, and validate synthetic datasets."""
+
     print("Generating synthetic dataset...")
-    
-    # Create the output directory if it doesn't exist
-    os.makedirs(config.SYNTHETIC_DATA_DIR, exist_ok=True)
-    
+
+    os.makedirs(
+        config.SYNTHETIC_DATA_DIR,
+        exist_ok=True,
+    )
+
     num_users = 50
     num_movies = 50
-    dim = config.EMBEDDING_DIM
-    
-    user_df = generate_factors(num_users, dim, seed=42)
-    movie_df = generate_factors(num_movies, dim, seed=43)
-    
+    embedding_dim = config.EMBEDDING_DIM
+
+    user_factors = generate_factors(
+        num_records=num_users,
+        dim=embedding_dim,
+        seed=42,
+    )
+
+    movie_factors = generate_factors(
+        num_records=num_movies,
+        dim=embedding_dim,
+        seed=43,
+    )
+
     user_path = config.SYNTHETIC_USER_FACTORS_PATH
     movie_path = config.SYNTHETIC_MOVIE_FACTORS_PATH
-    
-    # Write to Parquet using PyArrow engine
-    user_df.to_parquet(user_path, index=False, engine="pyarrow")
-    movie_df.to_parquet(movie_path, index=False, engine="pyarrow")
-    
-    print(f"Successfully wrote synthetic user factors to {user_path}")
-    print(f"Successfully wrote synthetic movie factors to {movie_path}")
-    
-    # Quick sanity checks
-    # Load back and verify
-    u_loaded = pd.read_parquet(user_path)
-    m_loaded = pd.read_parquet(movie_path)
-    
-    assert len(u_loaded) == num_users, f"Expected {num_users} users, got {len(u_loaded)}"
-    assert len(m_loaded) == num_movies, f"Expected {num_movies} movies, got {len(m_loaded)}"
-    
-    assert list(u_loaded.columns) == ["id", "features"], f"Expected columns ['id', 'features'], got {list(u_loaded.columns)}"
-    assert list(m_loaded.columns) == ["id", "features"], f"Expected columns ['id', 'features'], got {list(m_loaded.columns)}"
-    
-    # Check shape of features
-    first_feat = u_loaded["features"].iloc[0]
-    assert len(first_feat) == dim, f"Expected embedding size {dim}, got {len(first_feat)}"
-    assert isinstance(first_feat[0], (float, np.float32, float)), f"Expected float, got {type(first_feat[0])}"
-    
+
+    user_factors.to_parquet(
+        user_path,
+        index=False,
+        engine="pyarrow",
+    )
+
+    movie_factors.to_parquet(
+        movie_path,
+        index=False,
+        engine="pyarrow",
+    )
+
+    print(
+        f"Successfully wrote synthetic user factors to {user_path}"
+    )
+
+    print(
+        f"Successfully wrote synthetic movie factors to {movie_path}"
+    )
+
+    loaded_users = pd.read_parquet(
+        user_path,
+        engine="pyarrow",
+    )
+
+    loaded_movies = pd.read_parquet(
+        movie_path,
+        engine="pyarrow",
+    )
+
+    validate_factors(
+        dataframe=loaded_users,
+        expected_records=num_users,
+        expected_dim=embedding_dim,
+        dataset_name="User factors",
+    )
+
+    validate_factors(
+        dataframe=loaded_movies,
+        expected_records=num_movies,
+        expected_dim=embedding_dim,
+        dataset_name="Movie factors",
+    )
+
     print("Verification passed successfully!")
+
 
 if __name__ == "__main__":
     main()
