@@ -1,137 +1,213 @@
 from pathlib import Path
 import os
+import sys
 
 import pandas as pd
 import psycopg2
 from dotenv import load_dotenv
 
 
-# Load environment variables from the .env file if available
-load_dotenv()
-
-# Project root directory
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from config.schema import config
+
+
+load_dotenv(PROJECT_ROOT / ".env")
+
+
 USER_FACTORS_PATH = (
-    PROJECT_ROOT / "data" / "synthetic" / "user_factors.parquet"
+    PROJECT_ROOT
+    / "data"
+    / "synthetic"
+    / "user_factors.parquet"
 )
 
 MOVIE_FACTORS_PATH = (
-    PROJECT_ROOT / "data" / "synthetic" / "movie_factors.parquet"
+    PROJECT_ROOT
+    / "data"
+    / "synthetic"
+    / "movie_factors.parquet"
 )
 
 
 def get_database_connection():
-    """
-    Create a connection to the PostgreSQL database.
-    """
+    """Create a PostgreSQL database connection."""
 
     return psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=os.getenv("POSTGRES_PORT", "5433"),
         database=os.getenv("POSTGRES_DB", "cinescale"),
-        user=os.getenv("POSTGRES_USER", "cinescale_admin"),
-        password=os.getenv("POSTGRES_PASSWORD", "cinescale_password"),
+        user=os.getenv(
+            "POSTGRES_USER",
+            "cinescale_admin",
+        ),
+        password=os.getenv(
+            "POSTGRES_PASSWORD",
+            "cinescale_password",
+        ),
     )
 
 
-def convert_vector_to_pgvector(vector):
-    """
-    Convert a Python list into pgvector format.
+def convert_vector_to_pgvector(vector) -> str:
+    """Convert a vector into PostgreSQL pgvector format."""
 
-    Example:
-    [0.1, 0.2, 0.3]
-    """
+    if vector is None:
+        raise ValueError("Vector cannot be None.")
 
-    return "[" + ",".join(str(float(value)) for value in vector) + "]"
-
-
-def load_user_factors(connection):
-    """
-    Load user embeddings from the Parquet file into PostgreSQL.
-    """
-
-    if not USER_FACTORS_PATH.exists():
-        raise FileNotFoundError(
-            f"User factors file not found: {USER_FACTORS_PATH}"
+    if len(vector) != config.EMBEDDING_DIM:
+        raise ValueError(
+            f"Expected vector dimension "
+            f"{config.EMBEDDING_DIM}, "
+            f"but found {len(vector)}."
         )
 
-    dataframe = pd.read_parquet(USER_FACTORS_PATH)
+    try:
+        values = [float(value) for value in vector]
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Vector must contain numeric values only."
+        ) from error
+
+    return "[" + ",".join(
+        str(value) for value in values
+    ) + "]"
+
+
+def read_factors_file(
+    file_path: Path,
+    dataset_name: str,
+) -> pd.DataFrame:
+    """Read and validate a factors Parquet file."""
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"{dataset_name} file not found: {file_path}"
+        )
+
+    dataframe = pd.read_parquet(
+        file_path,
+        engine="pyarrow",
+    )
 
     required_columns = {"id", "features"}
 
-    if not required_columns.issubset(dataframe.columns):
+    if not required_columns.issubset(
+        dataframe.columns
+    ):
         raise ValueError(
-            "The user_factors.parquet file must contain "
+            f"{dataset_name} file must contain "
             "'id' and 'features' columns."
         )
 
+    if dataframe.empty:
+        raise ValueError(
+            f"{dataset_name} file contains no records."
+        )
+
+    if dataframe["id"].isnull().any():
+        raise ValueError(
+            f"{dataset_name} file contains missing IDs."
+        )
+
+    if dataframe["features"].isnull().any():
+        raise ValueError(
+            f"{dataset_name} file contains "
+            "missing feature vectors."
+        )
+
+    if dataframe["id"].duplicated().any():
+        raise ValueError(
+            f"{dataset_name} file contains duplicate IDs."
+        )
+
+    return dataframe
+
+
+def load_user_factors(connection) -> None:
+    """Load user embeddings into PostgreSQL."""
+
+    dataframe = read_factors_file(
+        USER_FACTORS_PATH,
+        "User factors",
+    )
+
     query = """
-        INSERT INTO cinescale.user_factors (user_id, features)
+        INSERT INTO cinescale.user_factors (
+            user_id,
+            features
+        )
         VALUES (%s, %s::vector)
         ON CONFLICT (user_id)
-        DO UPDATE SET features = EXCLUDED.features;
+        DO UPDATE SET
+            features = EXCLUDED.features;
     """
 
     records = [
         (
-            int(row["id"]),
-            convert_vector_to_pgvector(row["features"]),
+            int(row.id),
+            convert_vector_to_pgvector(
+                row.features
+            ),
         )
-        for _, row in dataframe.iterrows()
+        for row in dataframe.itertuples(
+            index=False
+        )
     ]
 
     with connection.cursor() as cursor:
         cursor.executemany(query, records)
 
-    print(f"Loaded {len(records)} user embeddings.")
+    print(
+        f"Loaded {len(records)} "
+        "user embeddings."
+    )
 
 
-def load_movie_factors(connection):
-    """
-    Load movie embeddings from the Parquet file into PostgreSQL.
-    """
+def load_movie_factors(connection) -> None:
+    """Load movie embeddings into PostgreSQL."""
 
-    if not MOVIE_FACTORS_PATH.exists():
-        raise FileNotFoundError(
-            f"Movie factors file not found: {MOVIE_FACTORS_PATH}"
-        )
-
-    dataframe = pd.read_parquet(MOVIE_FACTORS_PATH)
-
-    required_columns = {"id", "features"}
-
-    if not required_columns.issubset(dataframe.columns):
-        raise ValueError(
-            "The movie_factors.parquet file must contain "
-            "'id' and 'features' columns."
-        )
+    dataframe = read_factors_file(
+        MOVIE_FACTORS_PATH,
+        "Movie factors",
+    )
 
     query = """
-        INSERT INTO cinescale.movie_factors (movie_id, features)
+        INSERT INTO cinescale.movie_factors (
+            movie_id,
+            features
+        )
         VALUES (%s, %s::vector)
         ON CONFLICT (movie_id)
-        DO UPDATE SET features = EXCLUDED.features;
+        DO UPDATE SET
+            features = EXCLUDED.features;
     """
 
     records = [
         (
-            int(row["id"]),
-            convert_vector_to_pgvector(row["features"]),
+            int(row.id),
+            convert_vector_to_pgvector(
+                row.features
+            ),
         )
-        for _, row in dataframe.iterrows()
+        for row in dataframe.itertuples(
+            index=False
+        )
     ]
 
     with connection.cursor() as cursor:
         cursor.executemany(query, records)
 
-    print(f"Loaded {len(records)} movie embeddings.")
+    print(
+        f"Loaded {len(records)} "
+        "movie embeddings."
+    )
 
 
-def main():
-    """
-    Execute the complete database loading process.
-    """
+def main() -> None:
+    """Run the complete database loading process."""
 
     connection = None
 
@@ -140,20 +216,28 @@ def main():
 
         connection = get_database_connection()
 
-        print("Database connection established successfully.")
+        print(
+            "Database connection established "
+            "successfully."
+        )
 
         load_user_factors(connection)
         load_movie_factors(connection)
 
         connection.commit()
 
-        print("Database loading completed successfully.")
+        print(
+            "Database loading completed "
+            "successfully."
+        )
 
     except Exception as error:
         if connection is not None:
             connection.rollback()
 
-        print(f"Database loading failed: {error}")
+        print(
+            f"Database loading failed: {error}"
+        )
         raise
 
     finally:
