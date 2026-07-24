@@ -8,7 +8,6 @@ CREATE SCHEMA IF NOT EXISTS cinescale;
 CREATE TABLE IF NOT EXISTS cinescale.movies (
     movie_id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
-    release_year SMALLINT,
     genres TEXT
 );
 
