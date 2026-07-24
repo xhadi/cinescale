@@ -19,6 +19,7 @@ if project_root not in sys.path:
 from config.schema import config
 from pipeline.spark_session import get_spark_session
 from pipeline.etl import extract_data, transform_ratings, filter_low_support_items
+from pipeline.export_embeddings import export_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -316,3 +317,9 @@ if __name__ == "__main__":
     print(f"  Hit Rate@10:   {results['hit_rate_at_10']:.4f}")
     print(f"  Recall@10:     {results['recall_at_10']:.4f}")
     print(f"{'='*50}")
+    
+    user_factors_path, movie_factors_path = export_embeddings(
+        results["model"], config.PROCESSED_DATA_DIR
+    )
+    print(f"User factors exported to: {user_factors_path}")
+    print(f"Movie factors exported to: {movie_factors_path}")
