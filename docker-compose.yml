@@ -3,6 +3,7 @@ services:
     image: pgvector/pgvector:pg17
     container_name: cinescale_postgres
     restart: unless-stopped
+    shm_size: 256mb
 
     environment:
       POSTGRES_DB: cinescale
