@@ -40,9 +40,11 @@ def test_system_health():
     assert "total_users" in health
     assert "total_movies" in health
     assert "total_ratings" in health
+    assert "index_status" in health
     assert health["total_users"] > 0
     assert health["total_movies"] > 0
     assert health["total_ratings"] > 0
+    assert health["index_status"] == "present"
 
 
 def test_benchmark_recommendation_latency(any_user_id):

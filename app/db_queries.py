@@ -389,12 +389,18 @@ def get_system_health() -> Dict:
         SELECT 
             (SELECT COUNT(*) FROM cinescale.user_factors) AS total_users,
             (SELECT COUNT(*) FROM cinescale.movie_factors) AS total_movies,
-            (SELECT COUNT(*) FROM cinescale.ratings) AS total_ratings;
+            (SELECT COUNT(*) FROM cinescale.ratings) AS total_ratings,
+            (SELECT COUNT(*) FROM pg_indexes
+             WHERE schemaname = 'cinescale'
+               AND indexname = 'idx_movie_factors_hnsw_cosine') AS index_present;
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql)
-            return dict(cur.fetchone())
+            result = dict(cur.fetchone())
+            result["index_status"] = "present" if result["index_present"] else "missing"
+            del result["index_present"]
+            return result
 
 
 def benchmark_recommendation(user_id: int, runs: int = 100, return_raw_times: bool = False) -> Dict:

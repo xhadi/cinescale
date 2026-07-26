@@ -64,7 +64,7 @@ HNSW index: `vector_cosine_ops` with `m=16`, `ef_construction=64`.
 | p99 | 1.50 |
 | avg | 0.44 |
 
-Test command: `DATASET_SIZE=small python3 scripts/benchmark_stress.py --users 20 --runs 100`
+Test command: `DATASET_SIZE=32m python3 scripts/benchmark_stress.py --users 20 --runs 100`
 
 ## 6. Reproduction
 
@@ -100,7 +100,7 @@ DATASET_SIZE=small python3 database/db_loader.py
 ### 6.5 Run the stress harness
 
 ```bash
-DATASET_SIZE=small python3 scripts/benchmark_stress.py --users 20 --runs 100
+DATASET_SIZE=32m python3 scripts/benchmark_stress.py --users 20 --runs 100
 ```
 
 ## 7. 32M Dataset Notes
