@@ -25,6 +25,80 @@ from pipeline.export_embeddings import export_embeddings
 logger = logging.getLogger(__name__)
 
 
+def _get_top_k_recs_pandas_udf(item_ids_bc, item_matrix_bc, k_fetch: int):
+    """Return a pandas_udf that computes top-k recommendations for a batch of users.
+
+    Parameters
+    ----------
+    item_ids_bc
+        Broadcast variable containing item id values.
+    item_matrix_bc
+        Broadcast variable containing item factor matrix.
+    k_fetch
+        Number of top-scoring items to fetch per user.
+    """
+    import pandas as pd
+    import numpy as np
+    from pyspark.sql.functions import pandas_udf
+    from pyspark.sql.types import ArrayType, IntegerType
+
+    @pandas_udf(ArrayType(IntegerType()))
+    def _recs_udf(user_features_series: pd.Series) -> pd.Series:
+        items = item_ids_bc.value
+        i_matrix = item_matrix_bc.value
+        user_matrix = np.vstack(user_features_series.values).astype(i_matrix.dtype)
+        all_scores = user_matrix @ i_matrix.T
+        result = []
+        for scores in all_scores:
+            top_idx = np.argpartition(scores, -k_fetch)[-k_fetch:]
+            top_idx = top_idx[np.argsort(-scores[top_idx])]
+            result.append(items[top_idx].tolist())
+        del all_scores, user_matrix
+        return pd.Series(result)
+
+    return _recs_udf
+
+
+def _ndcg_udf(recommendations, relevant_items, train_items, k: int = 10):
+    """Compute binary-relevance NDCG@k for a single user.
+
+    Parameters
+    ----------
+    recommendations
+        Ranked list of recommended item ids.
+    relevant_items
+        Set of item ids considered relevant for the user.
+    train_items
+        Set of item ids to exclude from recommendations.
+    k
+        Number of recommendations to consider.
+    """
+    train_set = set(train_items) if train_items else set()
+    relevant_set = set(relevant_items)
+
+    ranked = []
+    for item in recommendations:
+        if item in train_set:
+            continue
+        ranked.append(item)
+        if len(ranked) == k:
+            break
+
+    dcg = 0.0
+    for i, item in enumerate(ranked, start=1):
+        if item in relevant_set:
+            dcg += 1.0 / math.log2(i + 1)
+
+    ideal_len = min(k, len(relevant_set))
+    idcg = 0.0
+    for i in range(1, ideal_len + 1):
+        idcg += 1.0 / math.log2(i + 1)
+
+    if idcg == 0.0:
+        return 0.0
+    return float(dcg / idcg)
+
+
 def load_and_prepare_ratings(spark: SparkSession, raw_dir: str) -> DataFrame:
     """Extract, transform, filter low-support items, and return clean ratings DataFrame."""
     _, raw_ratings_df = extract_data(spark, raw_dir)
@@ -124,23 +198,8 @@ def compute_precision_at_k(
     item_matrix_bc = spark.sparkContext.broadcast(item_matrix)
 
     K_FETCH_BUFFER = 5000
-
-    @pandas_udf(ArrayType(IntegerType()))
-    def get_top_k_recs(user_features_series: pd.Series) -> pd.Series:
-        items = item_ids_bc.value
-        i_matrix = item_matrix_bc.value
-        user_matrix = np.vstack(user_features_series.values).astype(i_matrix.dtype)
-        all_scores = user_matrix @ i_matrix.T
-
-        K_fetch = min(k + K_FETCH_BUFFER, len(items))
-        result = []
-        for scores in all_scores:
-            top_idx = np.argpartition(scores, -K_fetch)[-K_fetch:]
-            top_idx = top_idx[np.argsort(-scores[top_idx])]
-            result.append(items[top_idx].tolist())
-
-        del all_scores, user_matrix
-        return pd.Series(result)
+    k_fetch = min(k + K_FETCH_BUFFER, len(item_ids))
+    get_top_k_recs = _get_top_k_recs_pandas_udf(item_ids_bc, item_matrix_bc, k_fetch)
 
     print("3. Collecting distinct test users...")
     test_users = [r[user_col] for r in test_df.select(user_col).distinct().collect()]
@@ -286,23 +345,9 @@ def compute_ndcg_at_k(
     item_matrix_bc = spark.sparkContext.broadcast(item_matrix)
 
     K_FETCH_BUFFER = 5000
-
-    @pandas_udf(ArrayType(IntegerType()))
-    def get_top_k_recs(user_features_series: pd.Series) -> pd.Series:
-        items = item_ids_bc.value
-        i_matrix = item_matrix_bc.value
-        user_matrix = np.vstack(user_features_series.values).astype(i_matrix.dtype)
-        all_scores = user_matrix @ i_matrix.T
-
-        K_fetch = min(k + K_FETCH_BUFFER, len(items))
-        result = []
-        for scores in all_scores:
-            top_idx = np.argpartition(scores, -K_fetch)[-K_fetch:]
-            top_idx = top_idx[np.argsort(-scores[top_idx])]
-            result.append(items[top_idx].tolist())
-
-        del all_scores, user_matrix
-        return pd.Series(result)
+    k_fetch = min(k + K_FETCH_BUFFER, len(item_ids))
+    get_top_k_recs = _get_top_k_recs_pandas_udf(item_ids_bc, item_matrix_bc, k_fetch)
+    ndcg_udf = udf(lambda recs, rel, train: _ndcg_udf(recs, rel, train, k=k), DoubleType())
 
     print("NDCG: 3. Collecting distinct test users...")
     test_users = [r[user_col] for r in test_df.select(user_col).distinct().collect()]
@@ -330,33 +375,6 @@ def compute_ndcg_at_k(
     train_items_df.cache()
     train_items_df.count()
 
-    @udf(DoubleType())
-    def _ndcg_udf(recommendations, relevant_items, train_items):
-        train_set = set(train_items) if train_items else set()
-        relevant_set = set(relevant_items)
-
-        ranked = []
-        for item in recommendations:
-            if item in train_set:
-                continue
-            ranked.append(item)
-            if len(ranked) == k:
-                break
-
-        dcg = 0.0
-        for i, item in enumerate(ranked, start=1):
-            if item in relevant_set:
-                dcg += 1.0 / math.log2(i + 1)
-
-        ideal_len = min(k, len(relevant_set))
-        idcg = 0.0
-        for i in range(1, ideal_len + 1):
-            idcg += 1.0 / math.log2(i + 1)
-
-        if idcg == 0.0:
-            return 0.0
-        return float(dcg / idcg)
-
     total_ndcg_sum = 0.0
     total_users_counted = 0
     n_batches = (len(test_users) + user_batch_size - 1) // user_batch_size
@@ -381,7 +399,7 @@ def compute_ndcg_at_k(
 
         batch_ndcg = joined.withColumn(
             "ndcg",
-            _ndcg_udf(col("recommendations"), col("relevant_items"), col("train_items")),
+            ndcg_udf(col("recommendations"), col("relevant_items"), col("train_items")),
         )
 
         agg = batch_ndcg.agg(
@@ -414,7 +432,8 @@ def run_training() -> dict:
     """Main training pipeline: load, split, train, evaluate.
 
     Returns:
-        dict with keys: rmse, precision_at_10, model
+        dict with keys: rmse, precision_at_10, hit_rate_at_10, recall_at_10,
+        ndcg_at_10, model
     """
     spark = None
     try:

@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ from pipeline.train_als import (
     compute_rmse,
     compute_precision_at_k,
     compute_ndcg_at_k,
+    _ndcg_udf,
 )
 from pipeline.export_embeddings import export_embeddings
 
@@ -146,6 +148,24 @@ def test_compute_ndcg_at_k(spark: SparkSession, sample_ratings: DataFrame) -> No
     assert "ndcg" in metrics
     assert isinstance(metrics["ndcg"], float)
     assert 0.0 <= metrics["ndcg"] <= 1.0
+
+
+def test_ndcg_udf_math() -> None:
+    """Test the binary-relevance NDCG UDF with a hand-verified example."""
+    # top-4 recs: only the item at rank 1 (0-indexed) is relevant
+    recs = [10, 20, 30, 40]
+    relevant = [20]
+    # DCG = 1 / log2(1 + 2) = 1 / log2(3)
+    # IDCG = 1 / log2(1 + 1) = 1
+    expected = (1.0 / math.log2(3)) / 1.0
+    assert pytest.approx(_ndcg_udf(recs, relevant, []), rel=1e-5) == expected
+
+    # All top-3 are relevant, IDCG has 3 items
+    recs = [10, 20, 30]
+    relevant = [10, 20, 30]
+    dcg = 1.0 / math.log2(2) + 1.0 / math.log2(3) + 1.0 / math.log2(4)
+    idcg = dcg
+    assert pytest.approx(_ndcg_udf(recs, relevant, []), rel=1e-5) == 1.0
 
 
 def test_export_embeddings(tmp_path: Path) -> None:
