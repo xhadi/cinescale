@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 import math
-from typing import Tuple
+from typing import Any, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -99,6 +99,150 @@ def _ndcg_udf(recommendations, relevant_items, train_items, k: int = 10):
     return float(dcg / idcg)
 
 
+def _prepare_eval_data(
+    model: ALS,
+    train_df: DataFrame,
+    test_df: DataFrame,
+    spark: SparkSession,
+    rating_threshold: float,
+    user_col: str,
+    item_col: str,
+    rating_col: str,
+    user_batch_size: int,
+    arrow_batch_size: int,
+    K_FETCH_BUFFER: int = 5000,
+) -> Tuple[Any, Any, List[int], DataFrame, DataFrame]:
+    """Collect item factors, broadcast them, and prepare evaluation DataFrames.
+
+    Parameters
+    ----------
+    model
+        Fitted ALS model.
+    train_df
+        Training ratings DataFrame.
+    test_df
+        Test ratings DataFrame.
+    spark
+        Active SparkSession.
+    rating_threshold
+        Minimum rating considered relevant.
+    user_col
+        Name of the user id column.
+    item_col
+        Name of the item id column.
+    rating_col
+        Name of the rating column.
+    user_batch_size
+        Number of users to evaluate in a single batch.
+    arrow_batch_size
+        Max Arrow records per batch for pandas UDF.
+    K_FETCH_BUFFER
+        Unused in this helper; kept for API compatibility with _batch_eval_data.
+
+    Returns
+    -------
+    Tuple of (item_ids_bc, item_matrix_bc, test_users, relevant_items_df,
+    train_items_df).
+    """
+    import gc
+    from pyspark.sql import functions as F
+    from pyspark.sql.functions import col
+
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", str(arrow_batch_size))
+
+    print("1. Collecting Item Factors to driver...")
+    item_factors_pdf = model.itemFactors.toPandas()
+    item_ids = item_factors_pdf["id"].values.astype(np.int32)
+    item_matrix = np.vstack(item_factors_pdf["features"].values).astype(np.float32)
+    print(f"   Items: {len(item_ids)}, item_matrix memory: {item_matrix.nbytes / (1024**2):.2f} MB")
+    del item_factors_pdf
+    gc.collect()
+
+    print("2. Broadcasting item data...")
+    item_ids_bc = spark.sparkContext.broadcast(item_ids)
+    item_matrix_bc = spark.sparkContext.broadcast(item_matrix)
+
+    print("3. Collecting distinct test users...")
+    test_users = [r[user_col] for r in test_df.select(user_col).distinct().collect()]
+    print(f"   {len(test_users)} distinct test users -> batching by {user_batch_size}")
+
+    print("3a. Preparing relevant items per user (test set, rating >= threshold)...")
+    model_item_ids_df = model.itemFactors.select(col("id").alias(item_col)).distinct()
+
+    relevant_items_df = (
+        test_df.filter(col(rating_col) >= rating_threshold)
+        .join(model_item_ids_df, on=item_col, how="inner")
+        .groupBy(user_col)
+        .agg(F.collect_set(item_col).alias("relevant_items"))
+        .filter(F.size("relevant_items") > 0)
+    )
+    relevant_items_df.cache()
+    n_relevant_users = relevant_items_df.count()
+    print(f"   Number of users with model-known relevant items: {n_relevant_users}")
+
+    print("3b. Preparing each user's training-set items for exclusion...")
+    train_items_df = (
+        train_df.groupBy(user_col)
+        .agg(F.collect_set(item_col).alias("train_items"))
+    )
+    train_items_df.cache()
+    train_items_df.count()
+
+    return item_ids_bc, item_matrix_bc, test_users, relevant_items_df, train_items_df
+
+
+def _batch_eval_data(
+    model: ALS,
+    item_ids_bc,
+    item_matrix_bc,
+    test_users: List[int],
+    relevant_items_df: DataFrame,
+    train_items_df: DataFrame,
+    k: int,
+    user_batch_size: int,
+    user_col: str,
+    K_FETCH_BUFFER: int = 5000,
+):
+    """Yield joined recommendation DataFrames for each user batch.
+
+    The caller is responsible for triggering the action on the yielded
+    DataFrame (e.g., calling ``collect()`` or ``count()``). Cleanup of the
+    intermediate ``user_batch_df`` and ``recs_df`` happens after each yield.
+    """
+    import gc
+    from pyspark.sql.functions import col
+
+    k_fetch = min(k + K_FETCH_BUFFER, len(item_ids_bc.value))
+    get_top_k_recs = _get_top_k_recs_pandas_udf(item_ids_bc, item_matrix_bc, k_fetch)
+
+    n_batches = (len(test_users) + user_batch_size - 1) // user_batch_size
+
+    for b in range(n_batches):
+        batch_users = test_users[b * user_batch_size : (b + 1) * user_batch_size]
+        print(f"   Batch {b + 1}/{n_batches} - {len(batch_users)} users")
+
+        user_batch_df = (
+            model.userFactors.filter(col("id").isin(batch_users))
+            .withColumnRenamed("id", user_col)
+        )
+
+        recs_df = user_batch_df.withColumn(
+            "recommendations", get_top_k_recs(col("features"))
+        ).select(user_col, "recommendations")
+
+        joined = (
+            recs_df.join(relevant_items_df, on=user_col, how="inner")
+            .join(train_items_df, on=user_col, how="left")
+        )
+
+        yield joined
+
+        user_batch_df.unpersist()
+        recs_df.unpersist()
+        del user_batch_df, recs_df
+        gc.collect()
+
+
 def load_and_prepare_ratings(spark: SparkSession, raw_dir: str) -> DataFrame:
     """Extract, transform, filter low-support items, and return clean ratings DataFrame."""
     _, raw_ratings_df = extract_data(spark, raw_dir)
@@ -180,77 +324,36 @@ def compute_precision_at_k(
     """
     import gc
     from pyspark.sql import functions as F
-    from pyspark.sql.functions import pandas_udf, col
-    from pyspark.sql.types import ArrayType, IntegerType
 
-    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", str(arrow_batch_size))
-
-    print("1. Collecting Item Factors to driver...")
-    item_factors_pdf = model.itemFactors.toPandas()
-    item_ids = item_factors_pdf["id"].values.astype(np.int32)
-    item_matrix = np.vstack(item_factors_pdf["features"].values).astype(np.float32)
-    print(f"   Items: {len(item_ids)}, item_matrix memory: {item_matrix.nbytes / (1024**2):.2f} MB")
-    del item_factors_pdf
-    gc.collect()
-
-    print("2. Broadcasting item data...")
-    item_ids_bc = spark.sparkContext.broadcast(item_ids)
-    item_matrix_bc = spark.sparkContext.broadcast(item_matrix)
-
-    K_FETCH_BUFFER = 5000
-    k_fetch = min(k + K_FETCH_BUFFER, len(item_ids))
-    get_top_k_recs = _get_top_k_recs_pandas_udf(item_ids_bc, item_matrix_bc, k_fetch)
-
-    print("3. Collecting distinct test users...")
-    test_users = [r[user_col] for r in test_df.select(user_col).distinct().collect()]
-    print(f"   {len(test_users)} distinct test users -> batching by {user_batch_size}")
-
-    print("3a. Preparing relevant items per user (test set, rating >= threshold)...")
-    model_item_ids_df = model.itemFactors.select(col("id").alias(item_col)).distinct()
-
-    relevant_items_df = (
-        test_df.filter(col(rating_col) >= rating_threshold)
-        .join(model_item_ids_df, on=item_col, how="inner")
-        .groupBy(user_col)
-        .agg(F.collect_set(item_col).alias("relevant_items"))
-        .filter(F.size("relevant_items") > 0)
+    item_ids_bc, item_matrix_bc, test_users, relevant_items_df, train_items_df = _prepare_eval_data(
+        model,
+        train_df,
+        test_df,
+        spark,
+        rating_threshold,
+        user_col,
+        item_col,
+        rating_col,
+        user_batch_size,
+        arrow_batch_size,
     )
-    relevant_items_df.cache()
-    n_relevant_users = relevant_items_df.count()
-    print(f"   Number of users with model-known relevant items: {n_relevant_users}")
-
-    print("3b. Preparing each user's training-set items for exclusion...")
-    train_items_df = (
-        train_df.groupBy(user_col)
-        .agg(F.collect_set(item_col).alias("train_items"))
-    )
-    train_items_df.cache()
-    train_items_df.count()
 
     total_precision_sum = 0.0
     total_hits_sum = 0.0
     total_recall_sum = 0.0
     total_users_counted = 0
-    n_batches = (len(test_users) + user_batch_size - 1) // user_batch_size
 
-    for b in range(n_batches):
-        batch_users = test_users[b * user_batch_size : (b + 1) * user_batch_size]
-        print(f"   Batch {b + 1}/{n_batches} - {len(batch_users)} users")
-
-        user_batch_df = (
-            model.userFactors.filter(col("id").isin(batch_users))
-            .withColumnRenamed("id", user_col)
-        )
-
-        recs_df = user_batch_df.withColumn(
-            "recommendations", get_top_k_recs(col("features"))
-        ).select(user_col, "recommendations")
-
-        joined = (
-            recs_df.join(relevant_items_df, on=user_col, how="inner")
-            .join(train_items_df, on=user_col, how="left")
-        )
-
+    for joined in _batch_eval_data(
+        model,
+        item_ids_bc,
+        item_matrix_bc,
+        test_users,
+        relevant_items_df,
+        train_items_df,
+        k,
+        user_batch_size,
+        user_col,
+    ):
         metrics_row = joined.select(
             F.expr(
                 f"size(array_intersect("
@@ -282,9 +385,7 @@ def compute_precision_at_k(
             total_recall_sum += float(agg["sum_r"])
             total_users_counted += agg["cnt"]
 
-        user_batch_df.unpersist()
-        recs_df.unpersist()
-        del user_batch_df, recs_df, joined, metrics_row
+        del metrics_row, agg
         gc.collect()
 
     item_ids_bc.unpersist()
@@ -327,76 +428,36 @@ def compute_ndcg_at_k(
     """
     import gc
     from pyspark.sql import functions as F
-    from pyspark.sql.functions import pandas_udf, col
-    from pyspark.sql.types import ArrayType, IntegerType
 
-    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", str(arrow_batch_size))
+    item_ids_bc, item_matrix_bc, test_users, relevant_items_df, train_items_df = _prepare_eval_data(
+        model,
+        train_df,
+        test_df,
+        spark,
+        rating_threshold,
+        user_col,
+        item_col,
+        rating_col,
+        user_batch_size,
+        arrow_batch_size,
+    )
 
-    print("NDCG: 1. Collecting Item Factors to driver...")
-    item_factors_pdf = model.itemFactors.toPandas()
-    item_ids = item_factors_pdf["id"].values.astype(np.int32)
-    item_matrix = np.vstack(item_factors_pdf["features"].values).astype(np.float32)
-    print(f"   Items: {len(item_ids)}, item_matrix memory: {item_matrix.nbytes / (1024**2):.2f} MB")
-    del item_factors_pdf
-    gc.collect()
-
-    print("NDCG: 2. Broadcasting item data...")
-    item_ids_bc = spark.sparkContext.broadcast(item_ids)
-    item_matrix_bc = spark.sparkContext.broadcast(item_matrix)
-
-    K_FETCH_BUFFER = 5000
-    k_fetch = min(k + K_FETCH_BUFFER, len(item_ids))
-    get_top_k_recs = _get_top_k_recs_pandas_udf(item_ids_bc, item_matrix_bc, k_fetch)
     ndcg_udf = udf(lambda recs, rel, train: _ndcg_udf(recs, rel, train, k=k), DoubleType())
-
-    print("NDCG: 3. Collecting distinct test users...")
-    test_users = [r[user_col] for r in test_df.select(user_col).distinct().collect()]
-    print(f"   {len(test_users)} distinct test users -> batching by {user_batch_size}")
-
-    print("NDCG: 3a. Preparing relevant items per user (test set, rating >= threshold)...")
-    model_item_ids_df = model.itemFactors.select(col("id").alias(item_col)).distinct()
-
-    relevant_items_df = (
-        test_df.filter(col(rating_col) >= rating_threshold)
-        .join(model_item_ids_df, on=item_col, how="inner")
-        .groupBy(user_col)
-        .agg(F.collect_set(item_col).alias("relevant_items"))
-        .filter(F.size("relevant_items") > 0)
-    )
-    relevant_items_df.cache()
-    n_relevant_users = relevant_items_df.count()
-    print(f"   Number of users with model-known relevant items: {n_relevant_users}")
-
-    print("NDCG: 3b. Preparing each user's training-set items for exclusion...")
-    train_items_df = (
-        train_df.groupBy(user_col)
-        .agg(F.collect_set(item_col).alias("train_items"))
-    )
-    train_items_df.cache()
-    train_items_df.count()
 
     total_ndcg_sum = 0.0
     total_users_counted = 0
-    n_batches = (len(test_users) + user_batch_size - 1) // user_batch_size
 
-    for b in range(n_batches):
-        batch_users = test_users[b * user_batch_size : (b + 1) * user_batch_size]
-        print(f"   Batch {b + 1}/{n_batches} - {len(batch_users)} users")
-
-        user_batch_df = (
-            model.userFactors.filter(col("id").isin(batch_users))
-            .withColumnRenamed("id", user_col)
-        )
-
-        recs_df = user_batch_df.withColumn(
-            "recommendations", get_top_k_recs(col("features"))
-        ).select(user_col, "recommendations")
-
-        joined = (
-            recs_df.join(relevant_items_df, on=user_col, how="inner")
-            .join(train_items_df, on=user_col, how="left")
-        )
-
+    for joined in _batch_eval_data(
+        model,
+        item_ids_bc,
+        item_matrix_bc,
+        test_users,
+        relevant_items_df,
+        train_items_df,
+        k,
+        user_batch_size,
+        user_col,
+    ):
         batch_ndcg = joined.withColumn(
             "ndcg",
             ndcg_udf(col("recommendations"), col("relevant_items"), col("train_items")),
@@ -411,9 +472,7 @@ def compute_ndcg_at_k(
             total_ndcg_sum += float(agg["sum_ndcg"])
             total_users_counted += agg["cnt"]
 
-        user_batch_df.unpersist()
-        recs_df.unpersist()
-        del user_batch_df, recs_df, joined, batch_ndcg
+        del batch_ndcg, agg
         gc.collect()
 
     item_ids_bc.unpersist()
