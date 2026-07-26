@@ -77,19 +77,27 @@ DATASET_SIZE=small JAVA_HOME=/usr/lib/jvm/java-21-openjdk python3 pipeline/train
 
 The script prints RMSE, Precision@10, Hit Rate@10, Recall@10, and NDCG@10.
 
-### 6.2 Start the database
+### 6.2 Run ETL
 
 ```bash
-DATASET_SIZE=small docker compose up -d postgres
+DATASET_SIZE=small JAVA_HOME=/usr/lib/jvm/java-21-openjdk python3 pipeline/etl.py
 ```
 
-### 6.3 Load the database
+This produces `data/processed/movies_clean.parquet` and `data/processed/ratings_clean.parquet` required by the database loader.
+
+### 6.3 Start the database
+
+```bash
+docker compose up -d postgres
+```
+
+### 6.4 Load the database
 
 ```bash
 DATASET_SIZE=small python3 database/db_loader.py
 ```
 
-### 6.4 Run the stress harness
+### 6.5 Run the stress harness
 
 ```bash
 DATASET_SIZE=small python3 scripts/benchmark_stress.py --users 20 --runs 100
