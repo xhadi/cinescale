@@ -23,8 +23,10 @@ The production database was loaded with the full MovieLens 32M dataset:
 | Property | Value |
 |---|---|
 | Total users | 200,948 |
-| Total movies | 31,961 |
+| Total movies | 87,585 |
 | Total ratings | 31,842,705 |
+
+Items with embeddings (after min-ratings filter): 31,961.
 
 ## 3. Model
 
@@ -90,7 +92,7 @@ DATASET_SIZE=small python3 database/db_loader.py
 ### 6.4 Run the stress harness
 
 ```bash
-DATASET_SIZE=small python3 scripts/benchmark_stress.py --users 20 --runs 100 --output docs/stress_results.json
+DATASET_SIZE=small python3 scripts/benchmark_stress.py --users 20 --runs 100
 ```
 
 ## 7. 32M Dataset Notes

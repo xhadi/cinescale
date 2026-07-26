@@ -488,11 +488,11 @@ def compute_ndcg_at_k(
 
 
 def run_training() -> dict:
-    """Main training pipeline: load, split, train, evaluate.
+    """Main training pipeline: load, split, train, evaluate, export.
 
     Returns:
         dict with keys: rmse, precision_at_10, hit_rate_at_10, recall_at_10,
-        ndcg_at_10, model
+        ndcg_at_10, model, user_factors_path, movie_factors_path
     """
     spark = None
     try:
@@ -541,6 +541,13 @@ def run_training() -> dict:
         ndcg_at_10 = ndcg_metrics["ndcg"]
         logger.info(f"NDCG@10: {ndcg_at_10:.4f}")
 
+        logger.info("Exporting embeddings to Parquet...")
+        user_factors_path, movie_factors_path = export_embeddings(
+            model, config.PROCESSED_DATA_DIR
+        )
+        logger.info(f"User factors exported to: {user_factors_path}")
+        logger.info(f"Movie factors exported to: {movie_factors_path}")
+
         return {
             "rmse": rmse,
             "precision_at_10": precision_at_10,
@@ -548,6 +555,8 @@ def run_training() -> dict:
             "recall_at_10": recall_at_10,
             "ndcg_at_10": ndcg_at_10,
             "model": model,
+            "user_factors_path": user_factors_path,
+            "movie_factors_path": movie_factors_path,
         }
 
     finally:
@@ -570,9 +579,5 @@ if __name__ == "__main__":
     print(f"  Recall@10:     {results['recall_at_10']:.4f}")
     print(f"  NDCG@10:       {results['ndcg_at_10']:.4f}")
     print(f"{'='*50}")
-    
-    user_factors_path, movie_factors_path = export_embeddings(
-        results["model"], config.PROCESSED_DATA_DIR
-    )
-    print(f"User factors exported to: {user_factors_path}")
-    print(f"Movie factors exported to: {movie_factors_path}")
+    print(f"User factors exported to: {results['user_factors_path']}")
+    print(f"Movie factors exported to: {results['movie_factors_path']}")
