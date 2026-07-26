@@ -397,15 +397,21 @@ def get_system_health() -> Dict:
             return dict(cur.fetchone())
 
 
-def benchmark_recommendation(user_id: int, runs: int = 100) -> Dict:
+def benchmark_recommendation(user_id: int, runs: int = 100, return_raw_times: bool = False) -> Dict:
     """
     Benchmark the HNSW recommendation query latency.
 
     Runs the core similarity query `runs` times and reports p50/p95/p99.
     This is a raw benchmark — in production, use proper load-testing tools.
 
+    Args:
+        user_id: MovieLens user ID
+        runs: Number of query executions
+        return_raw_times: If True, include raw per-run latencies in the result
+
     Returns:
         Dict with keys: p50_ms, p95_ms, p99_ms, avg_ms, runs
+        (and raw_times_ms when return_raw_times is True)
     """
     import time
 
@@ -431,13 +437,16 @@ def benchmark_recommendation(user_id: int, runs: int = 100) -> Dict:
 
     times.sort()
     n = len(times)
-    return {
+    result = {
         "runs": runs,
         "avg_ms": round(sum(times) / n, 2),
         "p50_ms": round(times[int(n * 0.50)], 2),
         "p95_ms": round(times[int(n * 0.95)], 2),
         "p99_ms": round(times[int(n * 0.99)], 2),
     }
+    if return_raw_times:
+        result["raw_times_ms"] = times
+    return result
 
 
 # ---------------------------------------------------------------------------

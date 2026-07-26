@@ -6,6 +6,7 @@ Run against a loaded Postgres DB to collect p50/p95/p99 latency numbers.
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -18,10 +19,15 @@ from app import db_queries
 
 
 def percentile(values, pct):
-    values = sorted(values)
-    idx = int(len(values) * pct)
-    idx = min(idx, len(values) - 1)
-    return values[idx]
+    """Nearest-rank percentile for a list of raw latency measurements."""
+    if not values:
+        raise ValueError("percentile requires a non-empty list")
+    if not 0.0 <= pct <= 1.0:
+        raise ValueError("pct must be between 0 and 1")
+    sorted_vals = sorted(values)
+    rank = int(math.ceil(pct * len(sorted_vals))) - 1
+    rank = max(0, min(rank, len(sorted_vals) - 1))
+    return sorted_vals[rank]
 
 
 def main():
@@ -42,18 +48,24 @@ def main():
     random.seed(args.seed)
     sampled = random.sample(user_ids, min(args.users, len(user_ids)))
 
-    per_user_p50 = []
-    per_user_p95 = []
-    per_user_p99 = []
-    per_user_avg = []
+    all_times = []
+    per_user_summaries = []
 
     print(f"Benchmarking {len(sampled)} users with {args.runs} runs each...")
     for i, user_id in enumerate(sampled, 1):
-        result = db_queries.benchmark_recommendation(user_id, runs=args.runs)
-        per_user_p50.append(result["p50_ms"])
-        per_user_p95.append(result["p95_ms"])
-        per_user_p99.append(result["p99_ms"])
-        per_user_avg.append(result["avg_ms"])
+        result = db_queries.benchmark_recommendation(
+            user_id, runs=args.runs, return_raw_times=True
+        )
+        all_times.extend(result["raw_times_ms"])
+        per_user_summaries.append(
+            {
+                "user_id": user_id,
+                "p50_ms": result["p50_ms"],
+                "p95_ms": result["p95_ms"],
+                "p99_ms": result["p99_ms"],
+                "avg_ms": result["avg_ms"],
+            }
+        )
         print(
             f"  {i}/{len(sampled)} user {user_id}: "
             f"p50={result['p50_ms']:.2f}ms p95={result['p95_ms']:.2f}ms "
@@ -64,14 +76,14 @@ def main():
         "dataset_size": os.getenv("DATASET_SIZE", "unknown"),
         "users_sampled": len(sampled),
         "runs_per_user": args.runs,
-        "total_runs": len(sampled) * args.runs,
-        "p50_ms": percentile(per_user_p50, 0.50),
-        "p95_ms": percentile(per_user_p95, 0.95),
-        "p99_ms": percentile(per_user_p99, 0.99),
-        "avg_ms": sum(per_user_avg) / len(per_user_avg),
+        "total_runs": len(all_times),
+        "p50_ms": percentile(all_times, 0.50),
+        "p95_ms": percentile(all_times, 0.95),
+        "p99_ms": percentile(all_times, 0.99),
+        "avg_ms": sum(all_times) / len(all_times),
     }
 
-    print("\nAggregate latency report:")
+    print("\nAggregate latency report (over all raw runs):")
     print(f"  p50: {report['p50_ms']:.2f} ms")
     print(f"  p95: {report['p95_ms']:.2f} ms")
     print(f"  p99: {report['p99_ms']:.2f} ms")
