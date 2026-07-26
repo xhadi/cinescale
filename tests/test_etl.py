@@ -278,20 +278,7 @@ def test_transform_ratings(spark: SparkSession) -> None:
 
 def test_load_data(spark: SparkSession, tmp_path: Path) -> None:
     """Test that load_data correctly saves DataFrames as Parquet."""
-    from typing import Any
-    from unittest.mock import patch
-    import pyspark.sql.readwriter
     from pyspark.sql.types import StructType, StructField
-
-    # Patch DataFrameWriter.parquet to write via Pandas/PyArrow on Windows if winutils is missing
-    def mock_parquet(writer_self: Any, path: str, *args: Any, **kwargs: Any) -> None:
-        df = writer_self._df
-        pdf = df.toPandas()
-        os.makedirs(path, exist_ok=True)
-        part_file = os.path.join(path, "part-00000-mock.parquet")
-        pdf.to_parquet(part_file, index=False)
-        with open(os.path.join(path, "_SUCCESS"), "w") as f:
-            pass
 
     # Create small real DataFrames
     movies_schema = StructType([
@@ -313,8 +300,7 @@ def test_load_data(spark: SparkSession, tmp_path: Path) -> None:
 
     processed_dir = str(tmp_path / "processed")
 
-    with patch.object(pyspark.sql.readwriter.DataFrameWriter, "parquet", mock_parquet):
-        movies_path, ratings_path = load_data(movies_df, ratings_df, processed_dir)
+    movies_path, ratings_path = load_data(movies_df, ratings_df, processed_dir)
 
     # Verify output paths
     assert movies_path == os.path.join(processed_dir, "movies_clean.parquet")
@@ -324,9 +310,9 @@ def test_load_data(spark: SparkSession, tmp_path: Path) -> None:
     assert os.path.exists(movies_path)
     assert os.path.exists(ratings_path)
 
-    # Verify row counts via Pandas (since we wrote with Pandas fallback)
-    movies_pdf = pd.read_parquet(os.path.join(movies_path, "part-00000-mock.parquet"))
-    ratings_pdf = pd.read_parquet(os.path.join(ratings_path, "part-00000-mock.parquet"))
+    # Verify row counts via Pandas
+    movies_pdf = pd.read_parquet(movies_path)
+    ratings_pdf = pd.read_parquet(ratings_path)
 
     assert len(movies_pdf) == 2
     assert len(ratings_pdf) == 2

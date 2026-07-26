@@ -6,6 +6,9 @@ data/processed/
 docs/*
 AGENTS.md
 !docs/CineScale_Project_Plan.md
+!docs/vv_report.md
+!docs/architecture.md
+!docs/reflection.md
 
 # Python
 __pycache__/

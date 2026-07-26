@@ -389,23 +389,35 @@ def get_system_health() -> Dict:
         SELECT 
             (SELECT COUNT(*) FROM cinescale.user_factors) AS total_users,
             (SELECT COUNT(*) FROM cinescale.movie_factors) AS total_movies,
-            (SELECT COUNT(*) FROM cinescale.ratings) AS total_ratings;
+            (SELECT COUNT(*) FROM cinescale.ratings) AS total_ratings,
+            (SELECT COUNT(*) FROM pg_indexes
+             WHERE schemaname = 'cinescale'
+               AND indexname = 'idx_movie_factors_hnsw_cosine') AS index_present;
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql)
-            return dict(cur.fetchone())
+            result = dict(cur.fetchone())
+            result["index_status"] = "present" if result["index_present"] else "missing"
+            del result["index_present"]
+            return result
 
 
-def benchmark_recommendation(user_id: int, runs: int = 100) -> Dict:
+def benchmark_recommendation(user_id: int, runs: int = 100, return_raw_times: bool = False) -> Dict:
     """
     Benchmark the HNSW recommendation query latency.
 
     Runs the core similarity query `runs` times and reports p50/p95/p99.
     This is a raw benchmark — in production, use proper load-testing tools.
 
+    Args:
+        user_id: MovieLens user ID
+        runs: Number of query executions
+        return_raw_times: If True, include raw per-run latencies in the result
+
     Returns:
         Dict with keys: p50_ms, p95_ms, p99_ms, avg_ms, runs
+        (and raw_times_ms when return_raw_times is True)
     """
     import time
 
@@ -431,13 +443,16 @@ def benchmark_recommendation(user_id: int, runs: int = 100) -> Dict:
 
     times.sort()
     n = len(times)
-    return {
+    result = {
         "runs": runs,
         "avg_ms": round(sum(times) / n, 2),
         "p50_ms": round(times[int(n * 0.50)], 2),
         "p95_ms": round(times[int(n * 0.95)], 2),
         "p99_ms": round(times[int(n * 0.99)], 2),
     }
+    if return_raw_times:
+        result["raw_times_ms"] = times
+    return result
 
 
 # ---------------------------------------------------------------------------
