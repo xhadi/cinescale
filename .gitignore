@@ -39,3 +39,6 @@ jdk21/
 metastore_db/
 derby.log
 spark-warehouse/
+
+# Worktrees
+.worktrees/
