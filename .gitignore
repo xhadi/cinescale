@@ -43,5 +43,8 @@ metastore_db/
 derby.log
 spark-warehouse/
 
+# Power BI exports
+powerbi/
+
 # Worktrees
 .worktrees/
