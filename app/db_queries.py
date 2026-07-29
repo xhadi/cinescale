@@ -254,9 +254,9 @@ def get_trending_movies(limit: int = 10, min_ratings: int = 100) -> List[Dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
-def search_movies(query: str, limit: int = 20) -> List[Dict]:
+def search_movies(query: str, limit: int = 20, genre: str | None = None) -> List[Dict]:
     """
-    Fuzzy title search for the Explore panel search bar.
+    Fuzzy title search for the Explore panel search bar, with optional genre filter.
 
     Uses ILIKE for case-insensitive prefix matching. For production,
     consider pg_trgm or a dedicated search index.
@@ -264,19 +264,33 @@ def search_movies(query: str, limit: int = 20) -> List[Dict]:
     Returns:
         List of dicts with keys: movie_id, title, genres
     """
-    sql = """
+    conditions = []
+    params: list = []
+
+    if query:
+        conditions.append("title ILIKE %s")
+        params.append(f"%{query}%")
+    if genre:
+        conditions.append("genres ILIKE %s")
+        params.append(f"%{genre}%")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    sql = f"""
         SELECT 
             movie_id,
             title,
             genres
         FROM cinescale.movies
-        WHERE title ILIKE %s
+        {where}
         ORDER BY title
         LIMIT %s;
     """
+    params.append(limit)
+
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (f"%{query}%", limit))
+            cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
 
 
